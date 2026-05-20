@@ -1,0 +1,15 @@
+# Python
+.venv/
+DEP/.venv/
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# TouchDesigner auto-backups (large, change often)
+Backup/
+Archive/
+
+# Too large for GitHub (>100 MB) — keep locally, copy manually to other machines
+TOX/MediaPipe.tox
