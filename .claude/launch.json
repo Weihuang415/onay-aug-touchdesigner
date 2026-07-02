@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ui-mock",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["UI/mock_server.py"],
+      "port": 9980,
+      "autoPort": true
+    }
+  ]
+}

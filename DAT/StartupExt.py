@@ -17,6 +17,19 @@ class StartupExt:
         print("StartupExt.Startup()")
         self.AddDependenciesToPath()
         op.SETTINGS.Startup()
+        self.OpenUI()
+
+    def OpenUI(self) -> None:
+        """Open the web control UI in the default browser once the project is up"""
+        port = 9980
+        try:
+            port = int(op.UI.op("webserver1").par.port.eval())
+        except Exception:
+            pass
+        run(
+            f"import webbrowser; webbrowser.open('http://127.0.0.1:{port}')",
+            delayFrames=120,
+        )
 
 
     def AddDependenciesToPath(self) -> None:
