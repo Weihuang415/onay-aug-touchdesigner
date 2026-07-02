@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ONAY Control</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span class="dot" id="serverDot"></span>
+    <h1>ONAY <span>Control</span></h1>
+    <span class="meta" id="projectMeta">connecting&hellip;</span>
+  </div>
+  <div class="perf">
+    <div class="stat"><label>FPS</label><b id="fpsVal">--</b></div>
+    <div class="stat"><label>Target</label><b id="targetVal">--</b></div>
+    <div class="stat"><label>Clock</label><b id="clockVal">--</b></div>
+    <button id="patternBtn" class="btn" style="display:none">Test Pattern</button>
+    <button id="performBtn" class="btn">Perform Mode</button>
+  </div>
+</header>
+
+<main>
+
+  <section>
+    <div class="section-head">
+      <h2>Live</h2>
+      <label class="toggle">
+        <input type="checkbox" id="previewToggle" checked> live preview
+      </label>
+    </div>
+    <div class="live-wrap">
+      <div class="group">
+        <div class="group-title">Cameras</div>
+        <div class="grid" id="cameras"></div>
+        <div id="panels"></div>
+      </div>
+      <div class="group">
+        <div class="group-title">Displays</div>
+        <div class="grid" id="outputs"></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head"><h2>Displays &amp; Windows</h2></div>
+    <div class="two-col">
+      <div>
+        <h3>Monitors</h3>
+        <table id="monitorsTable">
+          <thead><tr><th>#</th><th>Name</th><th>Resolution</th><th>Position</th><th>Hz</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div>
+        <h3>Output Windows</h3>
+        <table id="windowsTable">
+          <thead><tr><th></th><th>Window</th><th>Monitor</th><th>Source</th><th>Actions</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Settings <span class="meta" id="nodeName"></span></h2>
+      <div>
+        <button class="btn" id="reloadSettingsBtn">Re-apply</button>
+        <button class="btn primary" id="saveSettingsBtn">Save</button>
+      </div>
+    </div>
+    <div class="settings-grid" id="settingsForm"></div>
+    <p class="hint" id="settingsHint"></p>
+  </section>
+
+</main>
+
+<footer>
+  <span id="footerInfo"></span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
