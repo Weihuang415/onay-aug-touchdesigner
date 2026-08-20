@@ -296,10 +296,14 @@ class _Detector:
 
 # ---------------------------------------------------------------- tracking
 
-def _update_tracks(dets, k):
+def _update_tracks(dets, k, dead):
     """Greedy IoU matching of detections to persistent tracks. Returns the
-    live tracks in id (creation) order — the rolling order stays stable
-    while people move around or briefly drop out."""
+    live tracks in id order — the rolling order stays stable while people
+    move around or briefly drop out.
+
+    dead = deadband as a fraction of the box size: detection wobble smaller
+    than this is ignored completely, so the box is rock solid on a person
+    standing still and only follows real movement."""
     for t in _TRACKS:
         t['matched'] = False
     pairs = []
@@ -317,8 +321,17 @@ def _update_tracks(dets, k):
         t['matched'] = True
         used.add(di)
         d = dets[di]
-        for j in range(4):
-            t['cur'][j] += (d[j] - t['cur'][j]) * k
+        c = t['cur']
+        move = True
+        if dead > 0.0:
+            rw = max(c[2], 1e-4)
+            rh = max(c[3], 1e-4)
+            delta = max(abs(d[0] - c[0]) / rw, abs(d[1] - c[1]) / rh,
+                        abs(d[2] - c[2]) / rw, abs(d[3] - c[3]) / rh)
+            move = delta >= dead
+        if move:
+            for j in range(4):
+                c[j] += (d[j] - c[j]) * k
         t['conf'] = d[4]
         t['missed'] = 0
         t['age'] += 1
@@ -442,7 +455,8 @@ def onCook(scriptOp):
     _LAST_T[0] = now
     tau = float(_par(comp, 'Smoothsecs', 0.25))
     k = 1.0 if tau <= 0.0 else 1.0 - float(np.exp(-dt / tau))
-    all_tracks = _update_tracks(dets, k)
+    dead = float(_par(comp, 'Deadband', 0.05))
+    all_tracks = _update_tracks(dets, k, dead)
     # only ESTABLISHED, currently-present tracks take part in the roll:
     # one-frame false positives never show, and a person who leaves stops
     # occupying a slot within ~0.13 s (no more boxes hanging in the air)
