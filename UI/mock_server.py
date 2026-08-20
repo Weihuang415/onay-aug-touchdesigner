@@ -95,6 +95,27 @@ class H(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith('/api/status'):
             return self._json(STATUS)
+        if self.path.startswith('/api/health'):
+            checks = [
+                {"label": "CAM Inside — Face Tracking · device", "status": "ok", "detail": "Logitech BRIO"},
+                {"label": "CAM Inside — Face Tracking · signal", "status": "ok", "detail": "1920x1080"},
+                {"label": "CAM Inside — Face Tracking · feed", "status": "ok", "detail": "frames updating"},
+                {"label": "CAM Outside — no FX · device", "status": "fail", "detail": "got 'OBSBOT Tiny', expected 'USB Capture SDI'"},
+                {"label": "CAM Outside — no FX · signal", "status": "fail", "detail": "no image (0x0)"},
+                {"label": "CAM Outside — no FX · feed", "status": "warn", "detail": "collecting baseline — run check again in a few seconds"},
+                {"label": "monitors · count", "status": "ok", "detail": "found 2, expected 2"},
+                {"label": "monitors · resolution", "status": "ok", "detail": "got ['1920x1080', '1920x1080']"},
+                {"label": "window1 · open", "status": "ok", "detail": "open"},
+                {"label": "window1 · monitor", "status": "ok", "detail": "on monitor 1, expected 1"},
+                {"label": "window1 · source", "status": "ok", "detail": "showing /project1/Monitors_layout"},
+                {"label": "performance · fps", "status": "ok", "detail": "58.7 / 60"},
+                {"label": "show · test pattern", "status": "ok", "detail": "off"},
+                {"label": "files · asset_path", "status": "ok", "detail": "C:/Users/days4/Desktop/Projects/2026/Onay_Aug/ASSETS"},
+            ]
+            summary = {"ok": 0, "warn": 0, "fail": 0}
+            for c in checks:
+                summary[c["status"]] += 1
+            return self._json({"checks": checks, "summary": summary, "time": "14:22:35"})
         if self.path.startswith('/api/cam'):
             self.send_response(200)
             self.send_header('Content-Type', 'image/jpeg')
@@ -107,6 +128,9 @@ class H(http.server.SimpleHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get('Content-Length', 0))
         payload = json.loads(self.rfile.read(n) or b'{}')
+        if self.path.startswith('/api/exec'):
+            return self._json({"ok": True, "out": f"(mock) executed: {payload.get('code', '')}",
+                               "result": "", "error": ""})
         print('ACTION:', payload)
         if payload.get('action') == 'perform_mode':
             STATUS['performMode'] = bool(payload.get('value'))

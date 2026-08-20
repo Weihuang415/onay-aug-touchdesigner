@@ -18,6 +18,16 @@ class StartupExt:
         self.AddDependenciesToPath()
         op.SETTINGS.Startup()
         self.OpenUI()
+        self.RestoreInsideCam()
+
+    def RestoreInsideCam(self) -> None:
+        """Re-apply the index-based CAM Inside camera choice picked in the
+        web UI (stored on op.UI). MediaPipe's page loads slowly, so wait
+        ~20 s; harmless no-op when the stored choice is 'auto'."""
+        run(
+            "mod('/project1/UI/webserver1_callbacks').ApplyStoredInsideCam()",
+            delayFrames=1200,
+        )
 
     def OpenUI(self) -> None:
         """Open the web control UI in the default browser once the project is up"""

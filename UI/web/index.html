@@ -19,11 +19,24 @@
     <div class="stat"><label>Target</label><b id="targetVal">--</b></div>
     <div class="stat"><label>Clock</label><b id="clockVal">--</b></div>
     <button id="patternBtn" class="btn" style="display:none">Test Pattern</button>
+    <button id="showModeBtn" class="btn"
+      title="exhibition setting: stop all preview rendering so the dashboard adds zero load, no matter how many tabs are open">Show Mode</button>
     <button id="performBtn" class="btn">Perform Mode</button>
   </div>
 </header>
 
 <main>
+
+  <section>
+    <div class="section-head">
+      <h2>Health Check</h2>
+      <div class="hc-head">
+        <span class="meta" id="healthSummary"></span>
+        <button class="btn primary" id="healthBtn">Run Check</button>
+      </div>
+    </div>
+    <div id="healthResults"></div>
+  </section>
 
   <section>
     <div class="section-head">
@@ -34,7 +47,11 @@
     </div>
     <div class="live-wrap">
       <div class="group">
-        <div class="group-title">Cameras</div>
+        <div class="group-title">Cameras
+          <button class="btn small" id="swapBtn"
+            title="swap which SDI capture device feeds CAM Inside (MediaPipe) vs CAM Outside (CAM_BEHIND)">Swap SDI &#x21c4;</button>
+          <span class="meta" id="swapMsg"></span>
+        </div>
         <div class="grid" id="cameras"></div>
         <div id="panels"></div>
       </div>
@@ -75,6 +92,19 @@
     </div>
     <div class="settings-grid" id="settingsForm"></div>
     <p class="hint" id="settingsHint"></p>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Python Console</h2>
+      <button class="btn small" id="consoleClear">Clear</button>
+    </div>
+    <div id="consoleOut"></div>
+    <div class="console-in">
+      <span class="prompt">&gt;&gt;&gt;</span>
+      <textarea id="consoleInput" rows="1" spellcheck="false"
+        placeholder="python — Enter to run · Shift+Enter newline · &uarr;/&darr; history"></textarea>
+    </div>
   </section>
 
 </main>

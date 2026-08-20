@@ -1,7 +1,7 @@
 /* ONAY Control UI */
 
 const STATUS_INTERVAL = 2000;   // ms between status polls
-const PREVIEW_INTERVAL = 700;   // ms between camera frame refreshes
+const PREVIEW_INTERVAL = 400;   // ms between preview loads (one image per tick)
 
 const $ = s => document.querySelector(s);
 
@@ -34,6 +34,7 @@ async function act(payload) {
 // ---------------------------------------------------------------- status
 
 async function pollStatus() {
+  if (document.hidden) return;   // don't queue work from a background tab
   try {
     const s = await api('/api/status');
     lastStatus = s;
@@ -57,6 +58,10 @@ function render(s) {
   const pBtn = $('#performBtn');
   pBtn.classList.toggle('active', s.performMode);
   pBtn.textContent = s.performMode ? 'Perform Mode: ON' : 'Perform Mode: OFF';
+
+  const sBtn = $('#showModeBtn');
+  sBtn.classList.toggle('active', s.showMode);
+  sBtn.textContent = s.showMode ? 'Show Mode: ON' : 'Show Mode: OFF';
 
   const tBtn = $('#patternBtn');
   if (s.testPattern === null || s.testPattern === undefined) {
@@ -116,7 +121,10 @@ function renderCameras(cams) {
       });
       card.querySelector('.devSel').addEventListener('change', ev => {
         const cur = lastStatus.cameras.find(x => camKey(x) === camKey(c));
-        if (cur && cur.deviceMenu)
+        if (!cur || !cur.deviceMenu) return;
+        if (cur.deviceMenu.action)   // index-based picker (CAM Inside)
+          act({ action: cur.deviceMenu.action, value: ev.target.value });
+        else
           act({ action: 'set_par', op: cur.deviceMenu.op, par: cur.deviceMenu.par, value: ev.target.value });
       });
       wrap.appendChild(card);
@@ -155,7 +163,12 @@ function renderCameras(cams) {
 
     card.querySelector('.detail').textContent =
       `${c.width}×${c.height} · ${c.path || '?'}`;
-    card.querySelector('.error').textContent = c.errors || c.warnings || '';
+    // two capture cards with the exact same name can't be told apart by
+    // MediaPipe's embedded browser — flag it right on the card
+    const dup = c.deviceMenu && c.deviceMenu.duplicates;
+    card.querySelector('.error').textContent = c.errors || c.warnings ||
+      (dup ? 'Both devices report the same name — this input can\'t be ' +
+             'switched until one is renamed (Magewell USB Capture Utility).' : '');
   }
 }
 
@@ -173,7 +186,9 @@ function makeSwitch(key, onClick) {
   b.className = 'switch parCtl';
   if (key) b.dataset.par = key;
   b.innerHTML = '<span class="knob"></span>';
-  b.addEventListener('click', onClick);
+  // blur after clicking — the value-refresh loop skips the focused element
+  // (to protect fields being edited), which would freeze the knob visually
+  b.addEventListener('click', () => { onClick(); b.blur(); });
   return b;
 }
 
@@ -187,6 +202,7 @@ function makeNumberInput(opPath, p) {
   inp.addEventListener('change', () => {
     const v = p.style === 'Int' ? parseInt(inp.value, 10) : parseFloat(inp.value);
     if (!Number.isNaN(v)) act({ action: 'set_par', op: opPath, par: p.name, value: v });
+    inp.blur();   // let the refresh loop show the (possibly clamped) real value
   });
   return inp;
 }
@@ -221,8 +237,10 @@ function makeControl(opPath, p) {
       o.textContent = p.menuLabels[i] || n;
       sel.appendChild(o);
     });
-    sel.addEventListener('change', () =>
-      act({ action: 'set_par', op: opPath, par: p.name, value: sel.value }));
+    sel.addEventListener('change', () => {
+      act({ action: 'set_par', op: opPath, par: p.name, value: sel.value });
+      sel.blur();
+    });
     f.appendChild(sel);
   } else {
     f.appendChild(makeNumberInput(opPath, p));
@@ -412,35 +430,57 @@ function renderOutputs(outs) {
   }
 }
 
-function refreshPreviews() {
-  if (!$('#previewToggle').checked || !lastStatus) return;
+// previews load ONE image per tick (round-robin) — firing them all at once
+// lands several readbacks in a single TD frame and stutters the timeline
+let previewCursor = 0;
+
+function previewTargets() {
+  const t = [];
   for (const c of lastStatus.cameras) {
     const card = $('#cameras').querySelector(`[data-key="${CSS.escape(camKey(c))}"]`);
     if (!card) continue;
-    const img = card.querySelector('img');
-    const noimg = card.querySelector('.noimg');
-    if (!c.path || !c.active || c.width <= 1) {
-      img.style.display = 'none';
-      noimg.style.display = '';
-      continue;
-    }
-    noimg.style.display = 'none';
-    img.style.display = '';
-    img.src = `/api/cam?path=${encodeURIComponent(c.path)}&t=${Date.now()}`;
+    const ok = c.path && c.active && c.width > 1;
+    t.push({ card, path: c.path, ok });
   }
   for (const o of (lastStatus.outputs || [])) {
     const card = $('#outputs').querySelector(`.out-card[data-key="${CSS.escape(o.label)}"]`);
     if (!card) continue;
-    const img = card.querySelector('img');
-    const noimg = card.querySelector('.noimg');
-    if (!o.path || o.width <= 1) {
-      img.style.display = 'none';
+    t.push({ card, path: o.path, ok: o.path && o.width > 1 });
+  }
+  return t;
+}
+
+function refreshPreviews() {
+  // a hidden tab gets its timers batched by the browser, which releases a
+  // burst of queued requests at TD all at once — poll only while visible
+  if (document.hidden || !$('#previewToggle').checked || !lastStatus) return;
+  const targets = previewTargets();
+  if (!targets.length) return;
+  if (lastStatus.showMode) {
+    // exhibition setting — no preview requests at all
+    for (const t of targets) {
+      t.card.querySelector('img').style.display = 'none';
+      const noimg = t.card.querySelector('.noimg');
       noimg.style.display = '';
-      continue;
+      noimg.textContent = 'previews off — show mode';
     }
-    noimg.style.display = 'none';
-    img.style.display = '';
-    img.src = `/api/cam?path=${encodeURIComponent(o.path)}&t=${Date.now()}`;
+    return;
+  }
+  for (const t of targets) {
+    const img = t.card.querySelector('img');
+    const noimg = t.card.querySelector('.noimg');
+    img.style.display = t.ok ? '' : 'none';
+    noimg.style.display = t.ok ? 'none' : '';
+    noimg.textContent = 'no signal';
+  }
+  // advance to the next live target and load just that one
+  for (let n = 0; n < targets.length; n++) {
+    const t = targets[(previewCursor + n) % targets.length];
+    if (!t.ok) continue;
+    previewCursor = (previewCursor + n + 1) % targets.length;
+    t.card.querySelector('img').src =
+      `/api/cam?path=${encodeURIComponent(t.path)}&t=${Date.now()}`;
+    break;
   }
 }
 
@@ -535,6 +575,110 @@ async function saveSettings() {
   }
 }
 
+// ---------------------------------------------------------------- health check
+
+async function runHealth() {
+  const btn = $('#healthBtn');
+  btn.disabled = true;
+  btn.textContent = 'CHECKING…';
+  try {
+    renderHealth(await api('/api/health'));
+  } catch (e) {
+    $('#healthSummary').textContent = 'health check failed: ' + e;
+    $('#healthSummary').className = 'meta sum-fail';
+  }
+  btn.disabled = false;
+  btn.textContent = 'RUN CHECK';
+}
+
+function renderHealth(h) {
+  const s = h.summary;
+  const sum = $('#healthSummary');
+  sum.textContent = `${s.ok} ok · ${s.warn} warn · ${s.fail} fail — ${h.time}`;
+  sum.className = 'meta ' + (s.fail ? 'sum-fail' : (s.warn ? 'sum-warn' : 'sum-ok'));
+
+  const wrap = $('#healthResults');
+  wrap.innerHTML = '';
+  for (const c of h.checks) {
+    const row = document.createElement('div');
+    row.className = 'hc ' + c.status;
+    row.innerHTML = `
+      <span class="hstat">${c.status}</span>
+      <span class="hlabel"></span>
+      <span class="hdetail"></span>`;
+    row.querySelector('.hlabel').textContent = c.label;
+    row.querySelector('.hdetail').textContent = c.detail;
+    wrap.appendChild(row);
+  }
+}
+
+$('#healthBtn').addEventListener('click', runHealth);
+// auto-run once the status polls have warmed the frozen-feed baseline
+setTimeout(runHealth, 3000);
+
+// ---------------------------------------------------------------- python console
+
+const consoleHistory = [];
+let consoleHistIdx = -1;
+
+function consoleAppend(text, cls) {
+  const out = $('#consoleOut');
+  const div = document.createElement('div');
+  div.className = 'cline ' + cls;
+  div.textContent = text;
+  out.appendChild(div);
+  while (out.children.length > 400) out.removeChild(out.firstChild);
+  out.scrollTop = out.scrollHeight;
+}
+
+async function runConsole(code) {
+  consoleAppend('>>> ' + code.replace(/\n/g, '\n... '), 'c-in');
+  try {
+    const r = await api('/api/exec', { method: 'POST', body: JSON.stringify({ code }) });
+    if (r.out) consoleAppend(r.out.replace(/\n$/, ''), 'c-out');
+    if (r.result) consoleAppend(r.result, 'c-res');
+    if (r.error) consoleAppend(r.error.replace(/\n$/, ''), 'c-err');
+  } catch (e) {
+    consoleAppend(String(e), 'c-err');
+  }
+}
+
+const consoleInput = $('#consoleInput');
+
+consoleInput.addEventListener('keydown', ev => {
+  if (ev.key === 'Enter' && !ev.shiftKey) {
+    ev.preventDefault();
+    const code = consoleInput.value.trim();
+    if (!code) return;
+    consoleHistory.push(code);
+    consoleHistIdx = consoleHistory.length;
+    consoleInput.value = '';
+    consoleInput.rows = 1;
+    runConsole(code);
+  } else if (ev.key === 'ArrowUp' && !consoleInput.value.includes('\n')) {
+    if (consoleHistIdx > 0) {
+      consoleHistIdx -= 1;
+      consoleInput.value = consoleHistory[consoleHistIdx];
+      ev.preventDefault();
+    }
+  } else if (ev.key === 'ArrowDown' && !consoleInput.value.includes('\n')) {
+    if (consoleHistIdx < consoleHistory.length - 1) {
+      consoleHistIdx += 1;
+      consoleInput.value = consoleHistory[consoleHistIdx];
+    } else {
+      consoleHistIdx = consoleHistory.length;
+      consoleInput.value = '';
+    }
+    ev.preventDefault();
+  }
+});
+
+consoleInput.addEventListener('input', () => {
+  consoleInput.rows = Math.min(8, consoleInput.value.split('\n').length);
+});
+
+$('#consoleClear').addEventListener('click', () => { $('#consoleOut').innerHTML = ''; });
+
 // ---------------------------------------------------------------- wiring
 
 $('#performBtn').addEventListener('click', () =>
@@ -542,6 +686,20 @@ $('#performBtn').addEventListener('click', () =>
 
 $('#patternBtn').addEventListener('click', () =>
   act({ action: 'test_pattern', value: !(lastStatus && lastStatus.testPattern) }));
+
+$('#showModeBtn').addEventListener('click', () =>
+  act({ action: 'show_mode', value: !(lastStatus && lastStatus.showMode) }));
+
+$('#swapBtn').addEventListener('click', async () => {
+  const msg = $('#swapMsg');
+  msg.textContent = 'swapping…';
+  msg.className = 'meta';
+  const res = await act({ action: 'swap_sdi' });
+  msg.textContent = res.ok
+    ? 'swapped — feeds settle in a few seconds'
+    : (res.error || 'swap failed');
+  msg.className = 'meta ' + (res.ok ? 'sum-ok' : 'sum-fail');
+});
 
 $('#saveSettingsBtn').addEventListener('click', saveSettings);
 
@@ -555,3 +713,6 @@ $('#reloadSettingsBtn').addEventListener('click', async () => {
 pollStatus();
 setInterval(pollStatus, STATUS_INTERVAL);
 setInterval(refreshPreviews, PREVIEW_INTERVAL);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) pollStatus();   // catch up as soon as we're visible
+});
