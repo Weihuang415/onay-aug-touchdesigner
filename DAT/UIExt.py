@@ -186,9 +186,17 @@ _req_log = []
 def _show_mode():
     """Show mode = exhibition setting: /api/cam does zero TOP cooking /
     readback so the dashboard adds no render load at all, no matter how many
-    tabs are polling. Stored on the UI comp -> persists in the .toe."""
+    tabs are polling. Stored on the UI comp -> persists in the .toe.
+    Perform mode IMPLIES show mode: while the show window is up (web
+    button, F1, or performOnStart) previews stop automatically, and come
+    back when perform mode exits (unless show mode was ON by itself)."""
     try:
-        return bool(op('/project1/UI').fetch('show_mode', False))
+        if bool(op('/project1/UI').fetch('show_mode', False)):
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(ui.performMode)
     except Exception:
         return False
 
