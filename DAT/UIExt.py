@@ -187,18 +187,30 @@ def _show_mode():
     """Show mode = exhibition setting: /api/cam does zero TOP cooking /
     readback so the dashboard adds no render load at all, no matter how many
     tabs are polling. Stored on the UI comp -> persists in the .toe.
-    Perform mode IMPLIES show mode: while the show window is up (web
-    button, F1, or performOnStart) previews stop automatically, and come
-    back when perform mode exits (unless show mode was ON by itself)."""
+
+    Perform mode IMPLIES show mode, but the web button can OVERRIDE it in
+    either direction while performing (e.g. switch previews back on to
+    peek during a show). The override is temporary: the next perform-mode
+    transition (on->off or off->on) clears it and auto behavior resumes."""
     try:
-        if bool(op('/project1/UI').fetch('show_mode', False)):
+        perform = bool(ui.performMode)
+    except Exception:
+        perform = False
+    uiop = op('/project1/UI')
+    if uiop is None:
+        return perform
+    try:
+        if uiop.fetch('show_last_perform', None) != perform:
+            uiop.store('show_last_perform', perform)
+            uiop.store('show_override', None)
+        ov = uiop.fetch('show_override', None)
+        if ov is not None:
+            return bool(ov)
+        if bool(uiop.fetch('show_mode', False)):
             return True
     except Exception:
         pass
-    try:
-        return bool(ui.performMode)
-    except Exception:
-        return False
+    return perform
 
 
 def _ensure_preview_ops():
@@ -930,7 +942,19 @@ def _do_action(payload):
             return {'ok': False, 'error': str(e)}
 
     if action == 'show_mode':
-        op('/project1/UI').store('show_mode', bool(payload.get('value')))
+        val = bool(payload.get('value'))
+        uiop = op('/project1/UI')
+        try:
+            performing = bool(ui.performMode)
+        except Exception:
+            performing = False
+        if performing:
+            # temporary override while performing; cleared on the next
+            # perform-mode transition
+            uiop.store('show_override', val)
+        else:
+            uiop.store('show_mode', val)
+            uiop.store('show_override', None)
         return {'ok': True}
 
     if action == 'set_inside_cam':
