@@ -39,8 +39,9 @@ def onCook(scriptOp):
         scriptOp.copyNumpyArray(arr)
         return
 
-    # one YELLOW box per raw detection + one GREEN square per face (its
+    # one YELLOW box per tracked person + one GREEN square each (their
     # smoothed crop window); the thick green one is on the output right now
+    labels = []
     src = comp.op('video_in')
     sw = max(1, src.width if src else W)
     sh = max(1, src.height if src else H)
@@ -48,6 +49,7 @@ def onCook(scriptOp):
     if t is not None and t.numRows > 1:
         for r in range(1, t.numRows):
             try:
+                tid = t[r, 'id'].val
                 cx = float(t[r, 'cx'])
                 cy = float(t[r, 'cy'])
                 w = float(t[r, 'w'])
@@ -64,6 +66,9 @@ def onCook(scriptOp):
             y1 = int(max(0, (1.0 - cy - h * 0.5) * H))
             y2 = int(min(H - 1, (1.0 - cy + h * 0.5) * H))
             cv2.rectangle(arr, (x1, y1), (x2, y2), (1.0, 0.85, 0.1, 1.0), 1)
+            # remember the label position in TOP-DOWN coords — text is
+            # drawn in one flipped pass at the end so it reads upright
+            labels.append(('#' + tid, x1 + 3, max(12, H - y2 + 14)))
             if sside > 0:
                 bw = sside / sw
                 bh = sside / sh
@@ -93,5 +98,12 @@ def onCook(scriptOp):
             cv2.rectangle(arr, (x1, y1), (x2, y2), (0.2, 1.0, 0.2, 1.0), 4)
     except Exception:
         pass
+
+    if labels:
+        arr = cv2.flip(arr, 0)   # top-down so text reads upright
+        for txt, x, y in labels:
+            cv2.putText(arr, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (1.0, 1.0, 1.0, 1.0), 1, cv2.LINE_AA)
+        arr = cv2.flip(arr, 0)
 
     scriptOp.copyNumpyArray(arr)

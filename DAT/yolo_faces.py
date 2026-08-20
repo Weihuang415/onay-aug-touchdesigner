@@ -1,28 +1,31 @@
-﻿# yolo_faces.py
-# Script CHOP callbacks: YOLOv8-face multi-face detection + "rolling" face
-# selection. Outputs ONE face box per cook as channels, cycling through all
-# detected faces every Rollseconds.
+# yolo_faces.py
+# Script CHOP callbacks: multi-face detection with ROTATION SWEEP and
+# IoU identity tracking, driving a "rolling" face selection.
 #
-# Channel convention matches the MediaPipe face_detector chain that CROP
-# already consumes (see CROP/select5 and the glsl1_pixel shader, which
-# treats tx/ty as the box's TOP-LEFT corner):
+# Rotation sweep: the background worker cycles through a set of angles,
+# rotating the (letterboxed) detection canvas before inference so tilted
+# faces appear upright to the model, then maps detections back into the
+# original frame. Results from all angles are merged with a light NMS.
+#
+# IoU tracking: detections are matched to persistent tracks by overlap,
+# so each person keeps a stable id (and stable rolling order) while
+# moving around — no more left-to-right index shuffling.
+#
+# Output channels (convention matches CROP's glsl1_pixel — tx/ty are the
+# box's TOP-LEFT corner):
 #   tx         = box LEFT edge, pixels from the left
 #   ty         = NEGATIVE box TOP edge, pixels (top-down, negated)
 #   width      = box side in pixels — always SQUARE (width == height)
 #   height     = same as width
 #   text       = 0 (kept for channel-layout compatibility)
-#   confidence = detector score of the current face (0 when no face)
+#   confidence = detector score of the current person (0 when nobody)
 #
-# When no face is present width/height/confidence go to 0 so the existing
+# When nobody is present width/height/confidence go to 0 so the existing
 # "nothing" fallback logic in CROP keeps working.
 #
-# Detection runs on a background thread (onnxruntime-directml on GPU,
-# cv2.dnn CPU fallback) — the main thread never waits for inference.
-# The frame is read from the sibling 'small1' TOP (640x360 downscale).
-#
 # Expected custom parameters on the parent COMP (page "YOLO Faces"):
-#   Source, Modelfile, Confidence, Holdframes, Rollseconds, Smoothsecs,
-#   Padscale, Active
+#   Source, Modelfile, Flipx, Active, Confidence, Holdframes, Smoothsecs,
+#   Sweepmode, Rollseconds, Glidesecs, Padscale, Showboxes
 
 import os
 import sys
@@ -33,12 +36,23 @@ import numpy as np
 import cv2
 
 NMS_THRESHOLD = 0.45
+MERGE_IOU = 0.4          # dedupe threshold when merging sweep angles
+TRACK_MATCH_IOU = 0.1    # min overlap to keep a detection on its track
+TRACK_MISS_LIMIT = 45    # cooks without a match before a track is dropped
 
 # the lindevs yolov8-face ONNX has a STATIC 640 input — other sizes fail
 MODEL_INPUT_SIZE = 640
 
 # seconds before a silent worker thread is considered hung
 WORKER_TIMEOUT = 5.0
+
+# angles (degrees) per sweep mode; the worker cycles through the list
+SWEEP_ANGLES = {
+    'off':  [0],
+    'tilt': [0, 45, -45],
+    'wide': [0, 45, -45, 90, -90],
+    'full': [0, 45, -45, 90, -90, 135, -135, 180],
+}
 
 # make DEP/.venv packages (onnxruntime-directml) importable even if
 # StartupExt.AddDependenciesToPath() has not run this session
@@ -47,8 +61,6 @@ try:
         os.path.join(project.folder, 'DEP/.venv/Lib/site-packages'))
     if os.path.isdir(_dep) and _dep not in sys.path:
         sys.path.insert(0, _dep)
-    # if the packages were copied in AFTER this path first entered sys.path,
-    # Python's negative finder cache hides them until invalidated
     import importlib
     importlib.invalidate_caches()
 except NameError:
@@ -57,12 +69,12 @@ except NameError:
 _DET = None          # _Detector instance, persists across cooks
 _INIT_ERROR = None   # model load error string, if any
 
-# PER-FACE smoothed box states, normalized top-down [cx, cy, w, h].
-# Each detected face keeps its own smoothed box, so switching faces can be
-# a hard CUT (like switching cameras) instead of a glide across the frame.
-_CURS = []
-# the OUTPUT window [cx, cy, side_px] — follows the current face's square;
-# Glidesecs > 0 makes it glide from face to face, 0 makes it cut
+# persistent tracks: {'id', 'cur' [cx,cy,w,h], 'conf', 'missed'}
+_TRACKS = []
+_NEXT_ID = [1]
+
+# the OUTPUT window [cx, cy, side_px] — follows the current track's square;
+# Glidesecs > 0 makes it glide between people, 0 makes it a hard cut
 _OUT = [0.5, 0.5, 0.0]
 _LAST_T = [0.0]
 _LAST_ROWS = [None]  # last faces-table contents, to skip redundant writes
@@ -87,20 +99,36 @@ def _resolve_model_path(raw):
     return os.path.normpath(path)
 
 
+def _iou(a, b):
+    """IoU of two (cx, cy, w, h, ...) boxes in normalized coords."""
+    ax1, ax2 = a[0] - a[2] * 0.5, a[0] + a[2] * 0.5
+    ay1, ay2 = a[1] - a[3] * 0.5, a[1] + a[3] * 0.5
+    bx1, bx2 = b[0] - b[2] * 0.5, b[0] + b[2] * 0.5
+    by1, by2 = b[1] - b[3] * 0.5, b[1] + b[3] * 0.5
+    iw = min(ax2, bx2) - max(ax1, bx1)
+    ih = min(ay2, by2) - max(ay1, by1)
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    union = a[2] * a[3] + b[2] * b[3] - inter
+    return inter / union if union > 0 else 0.0
+
+
 class _Detector:
-    """Runs YOLOv8-face on a background thread. Only one job in flight.
-    Boxes are (cx, cy, w, h, conf), normalized, top-down."""
+    """Runs YOLOv8-face on a background thread, one job in flight,
+    cycling through sweep angles. Boxes are (cx, cy, w, h, conf),
+    normalized, top-down, already mapped back to the unrotated frame."""
 
     def __init__(self, model_path, size):
         self.model_path = model_path
         self.size = int(size)
         self.error = None
-        self.boxes = []
-        self._raw = None
+        self._results = {}   # angle -> {'boxes': [...], 'hold': n}
+        self._raw = None     # latest thread result (angle, boxes)
+        self._angle_i = 0
         self._busy = False
         self._busy_since = 0.0
         self._stalls = 0
-        self._hold = 0
 
         self._net = None
         self._ort = None
@@ -136,23 +164,26 @@ class _Detector:
                               'detection disabled'.format(self.backend))
         return not self._busy and self._stalls < 3
 
-    def submit(self, rgb_u8, dw, dh, conf):
-        """rgb_u8: top-down uint8 RGB image already resized to fit self.size."""
+    def submit(self, rgb_u8, dw, dh, conf, angles):
+        """rgb_u8: top-down uint8 RGB already resized to fit self.size.
+        angles: current sweep list; the worker picks the next one."""
         if not self.idle:
             return
+        angle = angles[self._angle_i % len(angles)]
+        self._angle_i += 1
         self._busy = True
         self._busy_since = time.time()
         t = threading.Thread(
-            target=self._run, args=(rgb_u8, dw, dh, conf), daemon=True)
+            target=self._run, args=(rgb_u8, dw, dh, conf, angle), daemon=True)
         t.start()
 
-    def _run(self, rgb, dw, dh, conf):
+    def _run(self, rgb, dw, dh, conf, angle):
         try:
-            self._raw = self._infer(rgb, dw, dh, conf)
+            self._raw = (angle, self._infer(rgb, dw, dh, conf, angle))
             self.error = None
         except Exception as e:
             self.error = 'YOLO inference failed: {}'.format(e)
-            self._raw = []
+            self._raw = (angle, [])
         finally:
             self._busy = False
 
@@ -162,11 +193,20 @@ class _Detector:
             return self._net.forward()
         return self._ort.run(None, {self._ort_input: blob})[0]
 
-    def _infer(self, rgb, dw, dh, conf):
+    def _infer(self, rgb, dw, dh, conf, angle):
         s = self.size
         canvas = np.full((s, s, 3), 114, np.uint8)
         px, py = (s - dw) // 2, (s - dh) // 2
         canvas[py:py + dh, px:px + dw] = rgb
+
+        # rotate the square canvas so faces tilted by `angle` look upright
+        # (90° steps are lossless on a square; 45° steps lose the extreme
+        # corners of the letterboxed band — acceptable)
+        if angle:
+            M = cv2.getRotationMatrix2D((s * 0.5, s * 0.5), angle, 1.0)
+            canvas = cv2.warpAffine(
+                canvas, M, (s, s), flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=(114, 114, 114))
 
         blob = cv2.dnn.blobFromImage(
             canvas, 1.0 / 255.0, (s, s), swapRB=False, crop=False)
@@ -187,47 +227,113 @@ class _Detector:
         if idxs is None or len(idxs) == 0:
             return []
 
+        # rotate detected centers back into the unrotated canvas, then
+        # un-letterbox and normalize. Sizes stay as detected (the crop is
+        # square-of-max anyway, so box orientation doesn't matter).
+        if angle:
+            rad = np.deg2rad(angle)
+            ca, sa = np.cos(rad), np.sin(rad)
         result = []
         for i in np.array(idxs).flatten():
             i = int(i)
             cx, cy, w, h = boxes[i]
+            if angle:
+                dx, dy = cx - s * 0.5, cy - s * 0.5
+                cx = s * 0.5 + ca * dx - sa * dy
+                cy = s * 0.5 + sa * dx + ca * dy
+            side = max(float(w), float(h))
             result.append((
-                (cx - px) / dw,   # normalized, top-down
+                (cx - px) / dw,     # normalized, top-down
                 (cy - py) / dh,
-                w / dw,
-                h / dh,
+                side / dw,
+                side / dh,
                 float(scores[i]),
             ))
         return result
 
-    def collect(self, hold_frames):
-        """Merge the latest thread result into self.boxes (main thread)."""
-        res = self._raw
-        if res is not None:
+    def collect(self, hold_frames, angles):
+        """Merge the latest thread result into the per-angle store, then
+        return the NMS-merged union of every angle's current boxes."""
+        if self._raw is not None:
+            angle, res = self._raw
             self._raw = None
             if res:
-                self.boxes = res
-                self._hold = int(hold_frames)
-            else:
-                self._hold -= 1
-                if self._hold <= 0:
-                    self.boxes = []
-        return self.boxes
+                self._results[angle] = {'boxes': res,
+                                        'hold': int(hold_frames)}
+            elif angle in self._results:
+                self._results[angle]['hold'] -= 1
+                if self._results[angle]['hold'] <= 0:
+                    del self._results[angle]
+        # drop angles no longer in the sweep (mode changed)
+        for a in [a for a in self._results if a not in angles]:
+            del self._results[a]
+        merged = []
+        for r in self._results.values():
+            merged.extend(r['boxes'])
+        merged.sort(key=lambda b: -b[4])
+        out = []
+        for b in merged:
+            if all(_iou(b, k) < MERGE_IOU for k in out):
+                out.append(b)
+        return out
 
 
-def _write_faces_table(comp, boxes, squares, current_idx):
-    """Raw detections + each face's smoothed SQUARE window (scx, scy
-    normalized center; sside in source pixels) for the debug view."""
+# ---------------------------------------------------------------- tracking
+
+def _update_tracks(dets, k):
+    """Greedy IoU matching of detections to persistent tracks. Returns the
+    live tracks in id (creation) order — the rolling order stays stable
+    while people move around or briefly drop out."""
+    for t in _TRACKS:
+        t['matched'] = False
+    pairs = []
+    for ti, t in enumerate(_TRACKS):
+        for di, d in enumerate(dets):
+            v = _iou(t['cur'], d)
+            if v >= TRACK_MATCH_IOU:
+                pairs.append((v, ti, di))
+    pairs.sort(key=lambda x: -x[0])
+    used = set()
+    for v, ti, di in pairs:
+        t = _TRACKS[ti]
+        if t['matched'] or di in used:
+            continue
+        t['matched'] = True
+        used.add(di)
+        d = dets[di]
+        for j in range(4):
+            t['cur'][j] += (d[j] - t['cur'][j]) * k
+        t['conf'] = d[4]
+        t['missed'] = 0
+    for di, d in enumerate(dets):
+        if di not in used:
+            _TRACKS.append({'id': _NEXT_ID[0], 'cur': list(d[:4]),
+                            'conf': d[4], 'missed': 0, 'matched': True})
+            _NEXT_ID[0] += 1
+    for t in list(_TRACKS):
+        if not t['matched']:
+            t['missed'] += 1
+            t['conf'] = 0.0
+            if t['missed'] > TRACK_MISS_LIMIT:
+                _TRACKS.remove(t)
+    return list(_TRACKS)
+
+
+# ---------------------------------------------------------------- helpers
+
+def _write_faces_table(comp, tracks, squares, current_id):
     t = comp.op('faces')
     if t is None:
         return
-    rows = [['index', 'cx', 'cy', 'w', 'h', 'confidence', 'current',
+    rows = [['id', 'cx', 'cy', 'w', 'h', 'confidence', 'current',
              'scx', 'scy', 'sside']]
-    for i, (cx, cy, w, h, cf) in enumerate(boxes):
-        scx, scy, sside = squares[i] if i < len(squares) else (cx, cy, 0.0)
-        rows.append([str(i), '%.4f' % cx, '%.4f' % cy, '%.4f' % w,
-                     '%.4f' % h, '%.3f' % cf,
-                     '1' if i == current_idx else '0',
+    for i, tr in enumerate(tracks):
+        scx, scy, sside = squares[i]
+        rows.append([str(tr['id']),
+                     '%.4f' % tr['cur'][0], '%.4f' % tr['cur'][1],
+                     '%.4f' % tr['cur'][2], '%.4f' % tr['cur'][3],
+                     '%.3f' % tr['conf'],
+                     '1' if tr['id'] == current_id else '0',
                      '%.4f' % scx, '%.4f' % scy, '%.1f' % sside])
     if rows == _LAST_ROWS[0]:
         return
@@ -291,6 +397,8 @@ def onCook(scriptOp):
         scriptOp.addError(_DET.error)
 
     conf_thresh = float(_par(comp, 'Confidence', 0.35))
+    angles = SWEEP_ANGLES.get(str(_par(comp, 'Sweepmode', 'tilt')),
+                              SWEEP_ANGLES['tilt'])
 
     # hand a fresh downscaled frame to the worker whenever it is idle
     small_top = comp.op('small1')
@@ -304,52 +412,40 @@ def onCook(scriptOp):
             small = cv2.resize(arr, (dw, dh), interpolation=cv2.INTER_AREA)
             rgb = np.clip(small[::-1, :, :3], 0.0, 1.0)
             rgb = (rgb * 255.0).astype(np.uint8)  # top-down uint8 RGB
-            _DET.submit(rgb, dw, dh, conf_thresh)
+            _DET.submit(rgb, dw, dh, conf_thresh, angles)
 
-    boxes = _DET.collect(int(_par(comp, 'Holdframes', 12)))
-    # left-to-right order keeps face indices stable frame to frame
-    boxes = sorted(boxes, key=lambda b: b[0])
+    dets = _DET.collect(int(_par(comp, 'Holdframes', 12)), angles)
 
-    # --- rolling: which face is on the output right now
-    n = len(boxes)
-    roll_s = max(0.2, float(_par(comp, 'Rollseconds', 2.5)))
-    current_idx = int(absTime.seconds / roll_s) % n if n else -1
-
-    if n == 0:
-        # width/height/confidence 0 -> CROP's "nothing" fallback takes over
-        del _CURS[:]
-        _OUT[2] = 0.0   # next face snaps in instead of gliding from nowhere
-        _write_faces_table(comp, boxes, [], current_idx)
-        _set_chans(scriptOp, 0.5 * W, -(0.5 * H), 0, 0, 0, 0)
-        return
-
-    # --- per-face exponential smoothing (Smoothsecs = jitter time constant).
-    # Each face has its OWN smoothed box; the output CUTS between them.
+    # --- identity tracking (smoothing folded into the track update)
     now = absTime.seconds
     dt = max(0.0, now - _LAST_T[0]) or 1.0 / 60.0
     _LAST_T[0] = now
     tau = float(_par(comp, 'Smoothsecs', 0.25))
     k = 1.0 if tau <= 0.0 else 1.0 - float(np.exp(-dt / tau))
-    del _CURS[n:]
-    for i, b in enumerate(boxes):
-        if i >= len(_CURS):
-            _CURS.append([b[0], b[1], b[2], b[3]])   # new face: snap in
-        else:
-            c = _CURS[i]
-            for j in range(4):
-                c[j] += (b[j] - c[j]) * k
+    tracks = _update_tracks(dets, k)
 
-    # --- each face's SQUARE window in pixels (width == height)
+    n = len(tracks)
+    if n == 0:
+        _OUT[2] = 0.0   # next person snaps in instead of gliding from nowhere
+        _write_faces_table(comp, [], [], -1)
+        _set_chans(scriptOp, 0.5 * W, -(0.5 * H), 0, 0, 0, 0)
+        return
+
+    # --- rolling: which track is on the output right now
+    roll_s = max(0.2, float(_par(comp, 'Rollseconds', 2.5)))
+    current = tracks[int(absTime.seconds / roll_s) % n]
+
+    # --- each track's SQUARE window in pixels (width == height)
     pad = float(_par(comp, 'Padscale', 1.0))
     squares = []
-    for c in _CURS:
+    for tr in tracks:
+        c = tr['cur']
         side = min(max(c[2] * W, c[3] * H) * pad, W, H)
         squares.append((c[0], c[1], side))
 
-    _write_faces_table(comp, boxes, squares, current_idx)
+    _write_faces_table(comp, tracks, squares, current['id'])
 
-    # --- output window: cut or glide between faces (Glidesecs par)
-    scx, scy, side = squares[current_idx]
+    scx, scy, side = squares[tracks.index(current)]
     g = float(_par(comp, 'Glidesecs', 0.0))
     if g <= 0.0 or _OUT[2] <= 0.0:
         _OUT[0], _OUT[1], _OUT[2] = scx, scy, side       # hard cut
@@ -365,4 +461,4 @@ def onCook(scriptOp):
                -(ocy * H - oside * 0.5),    # ty: NEGATIVE top edge
                oside, oside,                # square
                0,
-               boxes[current_idx][4])       # confidence of the current face
+               current['conf'])

@@ -82,6 +82,13 @@ _num(page.appendInt('Holdframes', label='Hold Frames'), 12, 0, 60)
 _num(page.appendFloat('Smoothsecs', label='Jitter Smoothing (s)'),
      0.25, 0.0, 2.0)
 
+p = page.appendMenu('Sweepmode', label='Rotation Sweep')[0]
+p.menuNames = ['off', 'tilt', 'wide', 'full']
+p.menuLabels = ['Off (upright only)', 'Tilt (±45°)',
+                'Wide (±90°)', 'Full (all angles)']
+p.default = 'tilt'
+p.val = 'tilt'
+
 page.appendHeader('Hbox', label='OUTPUT BOX')
 
 _num(page.appendFloat('Rollseconds', label='Seconds Per Face'), 2.5, 0.3, 10.0)
