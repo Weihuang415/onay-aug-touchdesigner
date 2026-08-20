@@ -86,8 +86,11 @@ p = page.appendMenu('Sweepmode', label='Rotation Sweep')[0]
 p.menuNames = ['off', 'tilt', 'wide', 'full']
 p.menuLabels = ['Off (upright only)', 'Tilt (±45°)',
                 'Wide (±90°)', 'Full (all angles)']
-p.default = 'tilt'
-p.val = 'tilt'
+# off by default: rotated passes mistake static rectangles (door frames,
+# pictures) for faces — enable at the venue only if visitors will
+# actually be tilted/lying down, and re-tune Confidence there
+p.default = 'off'
+p.val = 'off'
 
 page.appendHeader('Hbox', label='OUTPUT BOX')
 

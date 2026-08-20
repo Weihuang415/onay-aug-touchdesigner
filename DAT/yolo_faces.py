@@ -36,9 +36,12 @@ import numpy as np
 import cv2
 
 NMS_THRESHOLD = 0.45
-MERGE_IOU = 0.4          # dedupe threshold when merging sweep angles
+MERGE_IOU = 0.35         # dedupe threshold when merging sweep angles
+ROTATED_CONF_BOOST = 0.2  # rotated passes see more junk — demand more score
 TRACK_MATCH_IOU = 0.1    # min overlap to keep a detection on its track
 TRACK_MISS_LIMIT = 45    # cooks without a match before a track is dropped
+TRACK_MIN_AGE = 4        # matches needed before a track may appear/roll
+TRACK_MISS_HIDE = 8      # missed cooks after which a track is hidden
 
 # the lindevs yolov8-face ONNX has a STATIC 640 input — other sizes fail
 MODEL_INPUT_SIZE = 640
@@ -70,8 +73,9 @@ _DET = None          # _Detector instance, persists across cooks
 _INIT_ERROR = None   # model load error string, if any
 
 # persistent tracks: {'id', 'cur' [cx,cy,w,h], 'conf', 'missed'}
+# ids are the SMALLEST free number, so a lone person is always #1 and the
+# count never climbs just because someone briefly dropped out
 _TRACKS = []
-_NEXT_ID = [1]
 
 # the OUTPUT window [cx, cy, side_px] — follows the current track's square;
 # Glidesecs > 0 makes it glide between people, 0 makes it a hard cut
@@ -194,6 +198,9 @@ class _Detector:
         return self._ort.run(None, {self._ort_input: blob})[0]
 
     def _infer(self, rgb, dw, dh, conf, angle):
+        if angle:
+            # rotated views produce more false positives — ask for more
+            conf = min(0.9, conf + ROTATED_CONF_BOOST)
         s = self.size
         canvas = np.full((s, s, 3), 114, np.uint8)
         px, py = (s - dw) // 2, (s - dh) // 2
@@ -273,7 +280,16 @@ class _Detector:
         merged.sort(key=lambda b: -b[4])
         out = []
         for b in merged:
-            if all(_iou(b, k) < MERGE_IOU for k in out):
+            dup = False
+            for k in out:
+                # same face seen from two sweep angles: high overlap OR
+                # centers closer than half a box (rotation mapping wobbles)
+                if (_iou(b, k) >= MERGE_IOU
+                        or (abs(b[0] - k[0]) < 0.5 * max(b[2], k[2])
+                            and abs(b[1] - k[1]) < 0.5 * max(b[3], k[3]))):
+                    dup = True
+                    break
+            if not dup:
                 out.append(b)
         return out
 
@@ -305,18 +321,22 @@ def _update_tracks(dets, k):
             t['cur'][j] += (d[j] - t['cur'][j]) * k
         t['conf'] = d[4]
         t['missed'] = 0
+        t['age'] += 1
     for di, d in enumerate(dets):
         if di not in used:
-            _TRACKS.append({'id': _NEXT_ID[0], 'cur': list(d[:4]),
-                            'conf': d[4], 'missed': 0, 'matched': True})
-            _NEXT_ID[0] += 1
+            taken = {t['id'] for t in _TRACKS}
+            nid = 1
+            while nid in taken:
+                nid += 1
+            _TRACKS.append({'id': nid, 'cur': list(d[:4]), 'conf': d[4],
+                            'missed': 0, 'age': 1, 'matched': True})
     for t in list(_TRACKS):
         if not t['matched']:
             t['missed'] += 1
             t['conf'] = 0.0
             if t['missed'] > TRACK_MISS_LIMIT:
                 _TRACKS.remove(t)
-    return list(_TRACKS)
+    return sorted(_TRACKS, key=lambda t: t['id'])
 
 
 # ---------------------------------------------------------------- helpers
@@ -422,7 +442,12 @@ def onCook(scriptOp):
     _LAST_T[0] = now
     tau = float(_par(comp, 'Smoothsecs', 0.25))
     k = 1.0 if tau <= 0.0 else 1.0 - float(np.exp(-dt / tau))
-    tracks = _update_tracks(dets, k)
+    all_tracks = _update_tracks(dets, k)
+    # only ESTABLISHED, currently-present tracks take part in the roll:
+    # one-frame false positives never show, and a person who leaves stops
+    # occupying a slot within ~0.13 s (no more boxes hanging in the air)
+    tracks = [t for t in all_tracks
+              if t['age'] >= TRACK_MIN_AGE and t['missed'] <= TRACK_MISS_HIDE]
 
     n = len(tracks)
     if n == 0:
