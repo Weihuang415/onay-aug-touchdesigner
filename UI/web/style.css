@@ -1,11 +1,11 @@
 :root {
   color-scheme: dark;
-  --bg: #0c0d10;
-  --panel: #111318;
-  --panel2: #16181f;
-  --line: #23262e;
-  --text: #d8dbe2;
-  --muted: #6f7684;
+  --bg: #000;
+  --panel: #14161c;
+  --panel2: #1b1e27;
+  --line: #343a4a;
+  --text: #f2f4f8;
+  --muted: #aab2c4;
   --accent: #4da3ff;
   --ok: #3ddc84;
   --warn: #ffb020;
@@ -155,10 +155,41 @@ h3 {
   letter-spacing: 1px;
 }
 .cam-card .preview img { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
+
+/* webrtc live preview: one shared 2x2 grid stream, each card crops its own
+   quadrant (the video is sized 200% and shifted by -100% per grid step) */
+.cam-card .preview { position: relative; overflow: hidden; }
+.cam-card .preview video.rtcvid {
+  position: absolute;
+  width: 200%;
+  height: 200%;
+  left: 0;
+  top: 0;
+  object-fit: fill;
+  background: #000;
+  display: none;
+}
+.cam-card .preview .rtcbadge {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  display: none;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  color: #fff;
+  background: rgba(200, 40, 40, 0.85);
+}
+.cam-card .preview.rtc-live img,
+.cam-card .preview.rtc-live .noimg { display: none; }
+.cam-card .preview.rtc-live video.rtcvid { display: block; }
+.cam-card .preview.rtc-live .rtcbadge { display: block; }
 .cam-card .info { padding: 10px 14px 14px; }
 .cam-card .row1 { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
 .cam-card .name { font-weight: 600; display: flex; align-items: center; gap: 8px; font-size: 13px; }
-.cam-card .detail { color: var(--muted); font-size: 11px; margin-top: 5px; word-break: break-all; font-family: var(--mono); }
+.cam-card .detail { color: var(--muted); font-size: 12px; margin-top: 5px; word-break: break-all; font-family: var(--mono); }
 .cam-card .error { color: var(--bad); font-size: 12px; margin-top: 4px; white-space: pre-wrap; }
 .cam-card .devrow { margin-top: 8px; }
 .cam-card .devrow select {

@@ -40,6 +40,8 @@ async function pollStatus() {
     lastStatus = s;
     $('#serverDot').className = 'dot ok';
     render(s);
+    rtcMaintain();
+    if (rtc.live) rtcAttach();   // re-mount videos if cards were rebuilt
   } catch (e) {
     $('#serverDot').className = 'dot';
     $('#projectMeta').textContent = 'disconnected — is TouchDesigner running?';
@@ -430,6 +432,128 @@ function renderOutputs(outs) {
   }
 }
 
+// ---------------------------------------------------------------- webrtc live previews
+//
+// TD streams one 1280x720 grid of all previews as a single WebRTC track
+// (hardware-encoded, no readbacks); each card shows its quadrant of the
+// shared stream via CSS cropping. Signaling runs over the same server's
+// WebSocket. If anything fails we fall back to the JPEG polling below.
+
+const rtc = {
+  ws: null, pc: null, conn: null, stream: null, layout: null,
+  live: false, denied: false, retryAt: 0,
+};
+
+function rtcTeardown(retryMs) {
+  if (rtc.pc) { try { rtc.pc.close(); } catch (e) {} }
+  if (rtc.ws) {
+    try {
+      if (rtc.ws.readyState === WebSocket.OPEN)
+        rtc.ws.send(JSON.stringify({ type: 'webrtc-stop' }));
+      rtc.ws.close();
+    } catch (e) {}
+  }
+  rtc.ws = rtc.pc = rtc.conn = rtc.stream = null;
+  rtc.live = false;
+  rtc.retryAt = Date.now() + (retryMs || 15000);
+  document.querySelectorAll('.preview.rtc-live')
+    .forEach(el => el.classList.remove('rtc-live'));
+}
+
+function rtcMaintain() {
+  // called from every status poll — starts, stops or retries the stream
+  if (!('RTCPeerConnection' in window) || !lastStatus) return;
+  const wantLive = !lastStatus.showMode && $('#previewToggle').checked && !document.hidden;
+  if (!wantLive) {
+    if (rtc.ws) rtcTeardown(3000);
+    rtc.denied = false;
+    return;
+  }
+  if (rtc.ws || rtc.denied && Date.now() < rtc.retryAt) return;
+  if (Date.now() < rtc.retryAt) return;
+  rtc.denied = false;
+
+  const ws = new WebSocket(`ws://${location.host}/`);
+  rtc.ws = ws;
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'webrtc-start' }));
+  ws.onclose = () => { if (rtc.ws === ws) rtcTeardown(); };
+  ws.onerror = () => { if (rtc.ws === ws) rtcTeardown(); };
+  ws.onmessage = async ev => {
+    let m;
+    try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.type === 'offer') {
+      rtc.conn = m.conn;
+      rtc.layout = m.layout || {};
+      const pc = new RTCPeerConnection();
+      rtc.pc = pc;
+      pc.ontrack = e => {
+        rtc.stream = e.streams[0] || new MediaStream([e.track]);
+        rtc.live = true;
+        rtcAttach();
+      };
+      pc.onicecandidate = e => {
+        if (e.candidate && ws.readyState === WebSocket.OPEN)
+          ws.send(JSON.stringify({
+            type: 'ice', conn: rtc.conn, candidate: e.candidate.candidate,
+            lineIndex: e.candidate.sdpMLineIndex, sdpMid: e.candidate.sdpMid,
+          }));
+      };
+      pc.onconnectionstatechange = () => {
+        if (['failed', 'disconnected', 'closed'].includes(pc.connectionState) && rtc.pc === pc)
+          rtcTeardown();
+      };
+      try {
+        await pc.setRemoteDescription({ type: 'offer', sdp: m.sdp });
+        const ans = await pc.createAnswer();
+        await pc.setLocalDescription(ans);
+        ws.send(JSON.stringify({ type: 'answer', conn: rtc.conn, sdp: ans.sdp }));
+      } catch (e) {
+        console.error('webrtc negotiation failed:', e);
+        rtcTeardown();
+      }
+    } else if (m.type === 'ice' && rtc.pc) {
+      try {
+        await rtc.pc.addIceCandidate({
+          candidate: m.candidate, sdpMLineIndex: m.lineIndex, sdpMid: m.sdpMid,
+        });
+      } catch (e) { /* harmless during teardown */ }
+    } else if (m.type === 'webrtc-denied') {
+      // show mode / full — stay on JPEG polling, retry later
+      rtc.denied = true;
+      rtcTeardown(m.reason === 'show mode' ? 5000 : 30000);
+    }
+  };
+}
+
+function rtcAttach() {
+  // give every card with a known quadrant a <video> cropped to its slice
+  if (!rtc.stream || !rtc.layout) return;
+  for (const t of previewTargets()) {
+    const key = t.card.dataset.key;
+    const q = rtc.layout[key];
+    const holder = t.card.querySelector('.preview');
+    if (!q) { holder.classList.remove('rtc-live'); continue; }
+    let vid = holder.querySelector('video.rtcvid');
+    if (!vid) {
+      vid = document.createElement('video');
+      vid.className = 'rtcvid';
+      vid.muted = true;
+      vid.autoplay = true;
+      vid.playsInline = true;
+      holder.appendChild(vid);
+      const badge = document.createElement('span');
+      badge.className = 'rtcbadge';
+      badge.textContent = 'LIVE';
+      holder.appendChild(badge);
+    }
+    vid.style.left = `${-q.x * 100}%`;
+    vid.style.top = `${-q.y * 100}%`;
+    if (vid.srcObject !== rtc.stream) vid.srcObject = rtc.stream;
+    vid.play().catch(() => {});
+    holder.classList.add('rtc-live');
+  }
+}
+
 // previews load ONE image per tick (round-robin) — firing them all at once
 // lands several readbacks in a single TD frame and stutters the timeline
 let previewCursor = 0;
@@ -454,6 +578,7 @@ function refreshPreviews() {
   // a hidden tab gets its timers batched by the browser, which releases a
   // burst of queued requests at TD all at once — poll only while visible
   if (document.hidden || !$('#previewToggle').checked || !lastStatus) return;
+  if (rtc.live) return;   // webrtc stream is covering the cards — no JPEGs
   const targets = previewTargets();
   if (!targets.length) return;
   if (lastStatus.showMode) {

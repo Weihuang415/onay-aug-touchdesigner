@@ -8,8 +8,10 @@ no TD reload needed.
 Endpoints:
   GET  /                 -> UI/web/index.html (all static files served from UI/web/)
   GET  /api/status       -> JSON: cameras, monitors, windows, settings, performance
-  GET  /api/cam?path=... -> JPEG snapshot of any TOP (used for live previews)
+  GET  /api/cam?path=... -> JPEG snapshot of any TOP (preview fallback)
   POST /api/action       -> JSON body {action: ..., ...} control commands
+  WS   /                 -> WebRTC signaling for live previews (see the
+                            "webrtc previews" section below)
 """
 
 import contextlib
@@ -60,19 +62,21 @@ OUTPUT_VIEWS = [
 # Window COMPs hidden from the dashboard (TD's own perform window etc.)
 IGNORE_WINDOWS = {'/perform'}
 
-# Custom toggle that switches the displays to a test pattern
-TEST_PATTERN = {'op': '/project1/Monitors_layout', 'par': 'Pattern'}
+# Custom toggle that switches the displays to a test pattern — Index on
+# Monitors_layout drives each monitor's switch1 (0 = show, 1 = test card)
+TEST_PATTERN = {'op': '/project1/Monitors_layout', 'par': 'Index'}
 
 # Expected show state, verified by the Health Check panel (/api/health).
 HEALTH = {
     # camera label -> substring that must appear in the selected device name.
-    # 'SDI' matches both the factory name ("USB Capture SDI") and renamed
-    # devices — after renaming them in the Magewell USB Capture Utility
-    # (e.g. "SDI Inside" / "SDI Outside"), tighten these to pin each camera
-    # to its own device.
+    # The cards are renamed in hardware (Magewell USB Capture Utility,
+    # Aug 21 2026): serial B207250604095 = "SDI_Inside_095", B207250604111 =
+    # "SDI_Outside_111" — each camera is pinned to its own card, so a swap
+    # shows up as a health-check fail (and AutoAssignCameras fixes it on
+    # the next startup).
     'cameraDevice': {
-        'CAM Inside — Face Tracking': 'SDI',
-        'CAM Outside — no FX': 'SDI',
+        'CAM Inside — Face Tracking': 'SDI_Inside',
+        'CAM Outside — no FX': 'SDI_Outside',
     },
     # current TEST setup: 2 output monitors + 1 operator screen, window1 on
     # monitor 0. Resolution check disabled while testing — re-enable for the
@@ -773,6 +777,14 @@ def _health():
                            f"got {['%dx%d' % g for g in got]}, expected {['%dx%d' % w for w in want]}"))
 
     # --- windows
+    # the window checks are a PRE-SHOW checklist — while developing (no
+    # perform/show mode) a mismatch is only a warn, so the dashboard isn't
+    # permanently red at home. During a performance it's a real fail.
+    try:
+        performing = bool(ui.performMode) or _show_mode()
+    except Exception:
+        performing = False
+    wsev = 'fail' if performing else 'warn'
     for wexp in HEALTH.get('windows', []):
         name = wexp['path'].rsplit('/', 1)[-1]
         info = _window_info(op(wexp['path']))
@@ -780,17 +792,20 @@ def _health():
             checks.append(_chk(f'{name} · window', 'fail', f"{wexp['path']} not found"))
             continue
         if wexp.get('mustBeOpen') and not info['isOpen']:
-            checks.append(_chk(f'{name} · open', 'fail', 'window is closed'))
+            checks.append(_chk(f'{name} · open', wsev, 'window is closed'
+                               + ('' if performing else ' (pre-show check)')))
         else:
             checks.append(_chk(f'{name} · open', 'ok', 'open' if info['isOpen'] else 'closed (not required)'))
         if 'monitor' in wexp:
             ok = info['monitor'] == wexp['monitor']
-            checks.append(_chk(f'{name} · monitor', 'ok' if ok else 'fail',
-                               f"on monitor {info['monitor']}, expected {wexp['monitor']}"))
+            checks.append(_chk(f'{name} · monitor', 'ok' if ok else wsev,
+                               f"on monitor {info['monitor']}, expected {wexp['monitor']}"
+                               + ('' if performing or ok else ' (pre-show check)')))
         if wexp.get('source'):
             ok = info['source'] == wexp['source']
-            checks.append(_chk(f'{name} · source', 'ok' if ok else 'fail',
-                               f"showing {info['source'] or 'nothing'}, expected {wexp['source']}"))
+            checks.append(_chk(f'{name} · source', 'ok' if ok else wsev,
+                               f"showing {info['source'] or 'nothing'}, expected {wexp['source']}"
+                               + ('' if performing or ok else ' (pre-show check)')))
 
     # --- performance
     fps = _actual_fps()
@@ -1129,6 +1144,135 @@ def onHTTPRequest(dat, request, response):
         return _json_response(response, {'error': traceback.format_exc()}, 500)
 
 
+# ---------------------------------------------------------------- webrtc previews
+#
+# Low-latency live previews: the 4 preview sources are composited into one
+# 1280x720 grid (preview_grid, column-major: left column = cameras, right
+# column = displays) and streamed to the dashboard as a single WebRTC video
+# track (NVENC, no readbacks — unlike /api/cam this never stalls the
+# timeline). Signaling runs over this Web Server DAT's WebSocket; TD is
+# always the offerer. The browser crops each card's quadrant with CSS.
+
+WEBRTC = '/project1/UI/webrtc1'
+GRID = '/project1/UI/preview_grid'
+# the WebRTC encode in this TD build (2025.32820) mirrors the frame
+# horizontally — preview_flip (flipx on, fed by the grid) pre-mirrors it
+# so clients receive the correct orientation
+STREAM_SRC = '/project1/UI/preview_flip'
+GRID_SRC = '/project1/UI/grid_src{}'
+MAX_RTC_CLIENTS = 3
+
+# conn id <-> ws client (module-level: a module reload drops the maps, the
+# browser notices the dead stream and simply starts a new one)
+_rtc = {'conn2client': {}, 'client2conn': {}, 'layout': None}
+
+
+def _rtc_send(client, obj):
+    try:
+        op('/project1/UI/webserver1').webSocketSendText(client, json.dumps(obj))
+    except Exception:
+        debug('webrtc: send to {!r} failed'.format(client))
+
+
+def _rtc_update_grid():
+    """Point the grid selects at the live camera/output TOPs (same resolution
+    logic as /api/status) and return the quadrant layout keyed by card label.
+    The layout TOP fills column-major: srcs 0,1 = left column, 2,3 = right."""
+    layout = {}
+    slots = []
+    for i, c in enumerate(_cameras()[:2]):
+        slots.append(c['path'])
+        layout[c['label']] = {'x': 0, 'y': i}
+    while len(slots) < 2:
+        slots.append('')
+    for i, o in enumerate(_outputs()[:2]):
+        slots.append(o['path'])
+        layout[o['label']] = {'x': 1, 'y': i}
+    for i in range(4):
+        s = op(GRID_SRC.format(i))
+        if s is not None:
+            s.par.top = slots[i] if i < len(slots) else ''
+    return layout
+
+
+def _rtc_vso_name(conn):
+    return 'vso_' + conn.replace('-', '')[:12]
+
+
+def _rtc_cleanup(conn, close=True):
+    client = _rtc['conn2client'].pop(conn, None)
+    if client is not None:
+        _rtc['client2conn'].pop(client, None)
+    if close:
+        try:
+            op(WEBRTC).closeConnection(conn)
+        except Exception:
+            pass
+    vso = op('/project1/UI/' + _rtc_vso_name(conn))
+    if vso is not None:
+        vso.destroy()
+
+
+def _rtc_start(client):
+    if _show_mode():
+        _rtc_send(client, {'type': 'webrtc-denied', 'reason': 'show mode'})
+        return
+    w = op(WEBRTC)
+    if w is None:
+        _rtc_send(client, {'type': 'webrtc-denied', 'reason': 'webrtc1 not found'})
+        return
+    old = _rtc['client2conn'].get(client)
+    if old:                       # repeat request from the same tab — restart
+        _rtc_cleanup(old)
+    if len(_rtc['conn2client']) >= MAX_RTC_CLIENTS:
+        _rtc_send(client, {'type': 'webrtc-denied', 'reason': 'too many viewers'})
+        return
+    _rtc['layout'] = _rtc_update_grid()
+    conn = w.openConnection()
+    _rtc['conn2client'][conn] = client
+    _rtc['client2conn'][client] = conn
+    w.addTrack(conn, 'preview', 'video')   # must exist before the offer
+    vso = op('/project1/UI').create(videostreamoutTOP, _rtc_vso_name(conn))
+    vso.nodeX, vso.nodeY = 1000, -650
+    vso.par.mode = 'webrtc'
+    vso.par.webrtc = WEBRTC
+    vso.par.webrtcconnection = conn
+    vso.par.webrtcvideotrack = 'preview'
+    vso.inputConnectors[0].connect(op(STREAM_SRC))
+    w.createOffer(conn)
+
+
+# --- forwarded here by webrtc1_callbacks (see DAT/WebRTCCallbacks.py)
+
+def WRTC_onOffer(w, conn, sdp):
+    client = _rtc['conn2client'].get(conn)
+    if client is None:
+        return
+    try:
+        w.setLocalDescription(conn, 'offer', sdp)
+    except Exception:
+        pass    # some builds already set it inside createOffer
+    _rtc_send(client, {'type': 'offer', 'conn': conn, 'sdp': sdp,
+                       'layout': _rtc['layout']})
+
+
+def WRTC_onAnswer(w, conn, sdp):
+    return      # TD is always the offerer here
+
+
+def WRTC_onIceCandidate(w, conn, candidate, lineIndex, sdpMid):
+    client = _rtc['conn2client'].get(conn)
+    if client is None:
+        return
+    _rtc_send(client, {'type': 'ice', 'conn': conn, 'candidate': candidate,
+                       'lineIndex': lineIndex, 'sdpMid': sdpMid})
+
+
+def WRTC_onConnectionStateChange(w, conn, state):
+    if state in ('failed', 'closed', 'disconnected'):
+        _rtc_cleanup(conn, close=(state != 'closed'))
+
+
 # ---------------------------------------------------------------- websocket / lifecycle
 
 def onWebSocketOpen(dat, client, uri):
@@ -1136,10 +1280,38 @@ def onWebSocketOpen(dat, client, uri):
 
 
 def onWebSocketClose(dat, client):
+    conn = _rtc['client2conn'].get(client)
+    if conn:
+        _rtc_cleanup(conn)
     return
 
 
 def onWebSocketReceiveText(dat, client, data):
+    try:
+        msg = json.loads(data)
+    except Exception:
+        return
+    t = msg.get('type', '')
+    if t == 'webrtc-start':
+        _rtc_start(client)
+        return
+    conn = msg.get('conn', '')
+    if conn and conn not in _rtc['conn2client']:
+        return                    # stale/unknown connection — ignore
+    w = op(WEBRTC)
+    if t == 'answer' and w is not None:
+        w.setRemoteDescription(conn, 'answer', msg.get('sdp', ''))
+    elif t == 'ice' and w is not None:
+        try:
+            w.addIceCandidate(conn, msg.get('candidate', ''),
+                              int(msg.get('lineIndex') or 0),
+                              msg.get('sdpMid') or '')
+        except Exception:
+            debug('webrtc: bad remote ice candidate')
+    elif t == 'webrtc-stop':
+        c = _rtc['client2conn'].get(client)
+        if c:
+            _rtc_cleanup(c)
     return
 
 
