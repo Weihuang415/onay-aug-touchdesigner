@@ -174,12 +174,29 @@ N_IMGS = [0, 2]   # what the LEFT eye may land on
 O_IMGS = [1]      # what the RIGHT eye lands on -> together they spell N O
 
 
+BLINK_IMG = 6      # the bar glyph (7.png) doubles as the closed eyelid
+BLINK_LEN = 0.12   # seconds a blink stays closed
+
+
+def _blink_now(side, n, p, hold):
+    """One eye, one quick blink per hold — which eye and when reshuffle
+    every cycle. p = seconds since the eyes settled."""
+    if p < 0.25:                       # let the landing breathe first
+        return False
+    blink_side = 'L' if _h('bside', n) < 0.5 else 'R'
+    if side != blink_side:
+        return False
+    bt = hold * (0.2 + 0.55 * _h('btime', n))
+    return bt <= p < bt + BLINK_LEN
+
+
 def _eye_run(side, final_pool):
     """Carousel that ARRIVES on the final glyph: the sequence is laid out
     backwards from the landing image, so every flip — including the last
     one onto the n/o — is exactly IMG_FLIP long. No speed-up before the
     stop. The stride changes every cycle (all of 1..6 are coprime with 7)
-    so the path through the glyphs still varies and the eyes never sync."""
+    so the path through the glyphs still varies and the eyes never sync.
+    While settled, the eyes occasionally blink (see _blink_now)."""
     t = absTime.seconds
     scramble, hold = _timing()
     cycle = scramble + hold
@@ -193,6 +210,8 @@ def _eye_run(side, final_pool):
     steps_total = max(1, int(scramble / flip))
     step = int(phase / flip)
     if phase >= scramble or step >= steps_total:
+        if _blink_now(side, n, phase - scramble, hold):
+            return BLINK_IMG
         return final
     stride = 1 + int(_h('stride', side, n) * 6)
     return (final - (steps_total - step) * stride) % IMG_COUNT
