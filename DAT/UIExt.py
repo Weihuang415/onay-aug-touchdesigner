@@ -45,7 +45,7 @@ PARAM_PANELS = [
     {'label': 'Face Crop', 'op': '/project1/CROP',
      'camera': 'CAM Inside — Face Tracking',
      'pars': ['Useyolo', 'Checkrectangle', 'Index',
-              'Valuex', 'Valuey', 'Valuez', 'Valuew']},
+              'Valuex', 'Valuey', 'Valuez', 'Valuew', 'Pixelate']},
 ]
 
 # What each display is actually showing — previewed in the Displays section.
