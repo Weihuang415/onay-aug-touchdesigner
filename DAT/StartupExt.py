@@ -1,4 +1,4 @@
-from TDStoreTools import StorageManager
+﻿from TDStoreTools import StorageManager
 import TDFunctions as TDF
 import os
 import sys
@@ -26,6 +26,10 @@ class StartupExt:
         print("StartupExt.Startup()")
         self.AddDependenciesToPath()
         op.SETTINGS.Startup()
+        # the perform window auto-opens on frame 1, before the monitor list
+        # and Monitors_layout are ready, so it lands on the wrong display —
+        # re-fit it once things have settled
+        run("op.STARTUP.FitPerformWindow()", delayFrames=120)
         self.OpenUI()
         self.RestoreInsideCam()
         # USB devices can enumerate late — check camera assignment after ~10 s
@@ -63,6 +67,16 @@ class StartupExt:
             f"op('{p}').par.device.menuIndex = {i}\nop('{p}').par.active = 1"
             for p, i in wrong.items())
         run(code, delayMilliSeconds=800)
+
+    def FitPerformWindow(self) -> None:
+        """Re-open /perform on its assigned monitor — same as the web UI's
+        PERFORM MODE: ON button (pulsing 'Open as Perform Window')."""
+        if not ui.performMode:
+            return
+        perform_op = op('/perform')
+        if perform_op is not None:
+            print("[startup] re-fitting perform window")
+            perform_op.par.performance.pulse()
 
     def RestoreInsideCam(self) -> None:
         """Re-apply the index-based CAM Inside camera choice picked in the

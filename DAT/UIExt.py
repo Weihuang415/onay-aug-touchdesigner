@@ -893,7 +893,16 @@ def _do_action(payload):
         return {'ok': True}
 
     if action == 'perform_mode':
-        ui.performMode = bool(payload.get('value'))
+        value = bool(payload.get('value'))
+        if value:
+            # ui.performMode = True alone doesn't re-fit the perform window
+            # to its assigned monitor; firing /perform's "Open as Perform
+            # Window" pulse (par.performance) does the same thing the manual
+            # button click does, so it lands correctly every time.
+            perform_op = op('/perform')
+            if perform_op is not None:
+                perform_op.par.performance.pulse()
+        ui.performMode = value
         return {'ok': True}
 
     if action == 'set_par':
